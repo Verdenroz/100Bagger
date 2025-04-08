@@ -45,7 +45,7 @@ async def fetch_day_data(session, date_str, semaphore):
 async def main():
     # Define the date range for the last 3 years
     end_date = datetime.datetime.now()
-    start_date = end_date - datetime.timedelta(days=2)
+    start_date = end_date - datetime.timedelta(days=3 * 365)
 
     # Generate business days using pandas
     dates = pd.bdate_range(start=start_date, end=end_date)
