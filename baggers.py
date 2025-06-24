@@ -43,12 +43,13 @@ class TickerBaggerAnalyzer:
         """
         self.partitioned_data_dir = Path(partitioned_data_dir)
 
-    def analyze_ticker(self, ticker: str, min_days: int = 1) -> Optional[BaggerResult]:
+    def analyze_ticker(self, ticker: str, min_days: int = 1, debug: bool = False) -> Optional[BaggerResult]:
         """Analyze a single ticker for bagger classification.
 
         Args:
             ticker: Stock ticker symbol to analyze
             min_days: Minimum number of trading days required for analysis (default: 1)
+            debug: Print debug information for failures
 
         Returns:
             BaggerResult if ticker can be analyzed, None if insufficient data or errors
@@ -56,7 +57,14 @@ class TickerBaggerAnalyzer:
         try:
             # Load ticker data
             ticker_data = self._load_ticker_data(ticker)
-            if ticker_data is None or len(ticker_data) < min_days:
+            if ticker_data is None:
+                if debug:
+                    print(f"DEBUG: {ticker} - No data file found")
+                return None
+
+            if len(ticker_data) < min_days:
+                if debug:
+                    print(f"DEBUG: {ticker} - Insufficient data: {len(ticker_data)} < {min_days} days")
                 return None
 
             # Sort by date and calculate returns
@@ -69,10 +77,18 @@ class TickerBaggerAnalyzer:
                   .filter(pl.col("price").is_not_null() & (pl.col("price") > 0)))
 
             if len(df) < min_days:
+                if debug:
+                    print(f"DEBUG: {ticker} - After filtering nulls/zeros: {len(df)} < {min_days} days")
+                return None
+
+            # Check for valid start price
+            start_price = df["price"][0]
+            if start_price <= 0:
+                if debug:
+                    print(f"DEBUG: {ticker} - Invalid start price: {start_price}")
                 return None
 
             # Calculate cumulative returns from start
-            start_price = df["price"][0]
             df = df.with_columns([
                 (pl.col("price") / start_price).alias("return_multiple")
             ])
@@ -112,7 +128,8 @@ class TickerBaggerAnalyzer:
             )
 
         except Exception as e:
-            print(f"Error analyzing {ticker}: {e}")
+            if debug:
+                print(f"ERROR analyzing {ticker}: {e}")
             return None
 
     def _load_ticker_data(self, ticker: str) -> Optional[pl.DataFrame]:
@@ -227,15 +244,27 @@ def batch_analyze_tickers(tickers: list[str], partitioned_data_dir: str = "stock
     return results
 
 
-def save_results_to_csv(results: list[BaggerResult], output_file: str = "bagger_analysis_results.csv"):
+def save_results_to_csv(results: list[BaggerResult], output_file: str = "bagger_analysis_results.csv",
+                        baggers_only: bool = True):
     """Save analysis results to a CSV file.
 
     Args:
         results: List of BaggerResult objects
         output_file: Output CSV file path
+        baggers_only: If True, only save actual baggers (exclude no_bagger category)
     """
     if not results:
         print("No results to save")
+        return
+
+    # Filter to only baggers if requested
+    if baggers_only:
+        filtered_results = [r for r in results if r.bagger_type != BaggerType.NO_BAGGER]
+        print(f"Filtering to baggers only: {len(filtered_results)} out of {len(results)} results")
+        results = filtered_results
+
+    if not results:
+        print("No bagger results to save after filtering")
         return
 
     # Convert results to DataFrame
@@ -256,18 +285,29 @@ def save_results_to_csv(results: list[BaggerResult], output_file: str = "bagger_
 
     df = pl.DataFrame(data)
     df.write_csv(output_file)
-    print(f"Results saved to {output_file}")
+    print(f"Bagger results saved to {output_file}")
 
 
-def save_results_to_parquet(results: list[BaggerResult], output_file: str = "bagger_analysis_results.parquet"):
+def save_results_to_parquet(results: list[BaggerResult], output_file: str = "bagger_analysis_results.parquet",
+                            baggers_only: bool = True):
     """Save analysis results to a parquet file.
 
     Args:
         results: List of BaggerResult objects
         output_file: Output parquet file path
+        baggers_only: If True, only save actual baggers (exclude no_bagger category)
     """
     if not results:
         print("No results to save")
+        return
+
+    # Filter to only baggers if requested
+    if baggers_only:
+        filtered_results = [r for r in results if r.bagger_type != BaggerType.NO_BAGGER]
+        results = filtered_results
+
+    if not results:
+        print("No bagger results to save after filtering")
         return
 
     # Convert results to DataFrame
@@ -288,16 +328,18 @@ def save_results_to_parquet(results: list[BaggerResult], output_file: str = "bag
 
     df = pl.DataFrame(data)
     df.write_parquet(output_file, compression='snappy')
-    print(f"Results saved to {output_file}")
+    print(f"Bagger results saved to {output_file}")
 
 
 def analyze_all_tickers(partitioned_data_dir: str = "stock_data_partitioned",
-                        progress_interval: int = 1000) -> list[BaggerResult]:
+                        progress_interval: int = 1000,
+                        sample_failures: bool = True) -> list[BaggerResult]:
     """Analyze all available tickers in the partitioned data.
 
     Args:
         partitioned_data_dir: Directory containing partitioned data
         progress_interval: How often to print progress updates
+        sample_failures: Whether to sample and report failure reasons
 
     Returns:
         List of BaggerResult objects (only successful analyses)
@@ -311,6 +353,17 @@ def analyze_all_tickers(partitioned_data_dir: str = "stock_data_partitioned",
 
     results = []
     failed_count = 0
+    failure_reasons = {
+        'no_data_file': 0,
+        'insufficient_raw_data': 0,
+        'insufficient_clean_data': 0,
+        'invalid_prices': 0,
+        'other_errors': 0
+    }
+
+    # Sample some failures for debugging
+    sample_failed_tickers = []
+    max_failure_samples = 10
 
     print("Starting batch analysis of all tickers...")
     for i, ticker in enumerate(all_tickers, 1):
@@ -320,16 +373,58 @@ def analyze_all_tickers(partitioned_data_dir: str = "stock_data_partitioned",
                   f"Success rate: {success_rate:.1f}% "
                   f"({len(results):,} successful, {failed_count:,} failed)")
 
-        result = analyzer.analyze_ticker(ticker)
+        # Enable debug for first few failures to understand patterns
+        debug_mode = sample_failures and len(sample_failed_tickers) < max_failure_samples
+
+        result = analyzer.analyze_ticker(ticker, debug=debug_mode)
         if result:
             results.append(result)
         else:
             failed_count += 1
+            if debug_mode:
+                sample_failed_tickers.append(ticker)
+                # Categorize failure reason by trying to load data
+                try:
+                    ticker_data = analyzer._load_ticker_data(ticker)
+                    if ticker_data is None:
+                        failure_reasons['no_data_file'] += 1
+                    elif len(ticker_data) < 252:
+                        failure_reasons['insufficient_raw_data'] += 1
+                    else:
+                        # Check if it's a data quality issue
+                        df = (ticker_data
+                              .sort("date")
+                              .with_columns([
+                            pl.col("date").str.to_date(),
+                            pl.col("adjusted_close").alias("price")
+                        ])
+                              .filter(pl.col("price").is_not_null() & (pl.col("price") > 0)))
+
+                        if len(df) < 252:
+                            failure_reasons['insufficient_clean_data'] += 1
+                        else:
+                            failure_reasons['invalid_prices'] += 1
+                except:
+                    failure_reasons['other_errors'] += 1
 
     print(f"\n✅ Analysis complete!")
     print(f"Successfully analyzed: {len(results):,} tickers")
     print(f"Failed to analyze: {failed_count:,} tickers")
     print(f"Success rate: {(len(results) / len(all_tickers)) * 100:.1f}%")
+
+    if sample_failures and failed_count > 0:
+        print(f"\n--- Failure Analysis (sampled from first {max_failure_samples} failures) ---")
+        total_sampled = sum(failure_reasons.values())
+        if total_sampled > 0:
+            for reason, count in failure_reasons.items():
+                if count > 0:
+                    percentage = (count / total_sampled) * 100
+                    print(f"  {reason.replace('_', ' ').title()}: {count} ({percentage:.1f}%)")
+
+        if sample_failed_tickers:
+            print(f"\nSample failed tickers: {', '.join(sample_failed_tickers[:5])}")
+            if len(sample_failed_tickers) > 5:
+                print(f"... and {len(sample_failed_tickers) - 5} more")
 
     return results
 
@@ -372,12 +467,6 @@ def print_summary_stats(results: list[BaggerResult]):
         for r in top_current:
             print(f"  {r.ticker}: {r.final_return_multiple:.1f}x (peak: {r.max_return_multiple:.1f}x)")
 
-    if multibaggers:
-        top_multis = sorted(multibaggers, key=lambda x: x.final_return_multiple, reverse=True)[:5]
-        print(f"\nTop 5 Current Multibaggers (by final return):")
-        for r in top_multis:
-            print(f"  {r.ticker}: {r.final_return_multiple:.1f}x (peak: {r.max_return_multiple:.1f}x)")
-
     if fallen_hundred:
         top_fallen = sorted(fallen_hundred, key=lambda x: x.max_return_multiple, reverse=True)[:5]
         print(f"\nTop 5 Fallen 100-Baggers (by peak return):")
@@ -396,15 +485,23 @@ if __name__ == "__main__":
         # Print summary statistics
         print_summary_stats(results)
 
-        # Save to both CSV and Parquet
-        print(f"\nSaving results...")
-        save_results_to_csv(results, "bagger_analysis_results.csv")
-        save_results_to_parquet(results, "bagger_analysis_results.parquet")
+        # Save to both CSV and Parquet (baggers only)
+        print(f"\nSaving bagger results...")
+        save_results_to_csv(results, "bagger_analysis_results.csv", baggers_only=True)
+        save_results_to_parquet(results, "bagger_analysis_results.parquet", baggers_only=True)
 
-        print(f"\n✅ Analysis complete! Results saved to:")
+        # Count baggers vs non-baggers
+        bagger_results = [r for r in results if r.bagger_type != BaggerType.NO_BAGGER]
+        non_bagger_count = len(results) - len(bagger_results)
+
+        print(f"\n✅ Analysis complete! Bagger results saved to:")
         print(f"  - bagger_analysis_results.csv")
         print(f"  - bagger_analysis_results.parquet")
-        print(f"\nYou can now analyze the results using:")
+        print(f"\nSummary:")
+        print(f"  Total analyzed: {len(results):,} tickers")
+        print(f"  Actual baggers: {len(bagger_results):,} tickers ({(len(bagger_results) / len(results) * 100):.1f}%)")
+        print(f"  Non-baggers (excluded): {non_bagger_count:,} tickers ({(non_bagger_count / len(results) * 100):.1f}%)")
+        print(f"\nYou can now analyze the bagger results using:")
         print(f"  df = pl.read_csv('bagger_analysis_results.csv')")
         print(f"  # or")
         print(f"  df = pl.read_parquet('bagger_analysis_results.parquet')")
