@@ -1,8 +1,9 @@
-import polars as pl
-from pathlib import Path
-from typing import Dict, Optional, Tuple
 from dataclasses import dataclass
 from enum import Enum
+from pathlib import Path
+from typing import Optional
+
+import polars as pl
 
 
 class BaggerType(Enum):
@@ -42,12 +43,12 @@ class TickerBaggerAnalyzer:
         """
         self.partitioned_data_dir = Path(partitioned_data_dir)
 
-    def analyze_ticker(self, ticker: str, min_days: int = 252) -> Optional[BaggerResult]:
+    def analyze_ticker(self, ticker: str, min_days: int = 1) -> Optional[BaggerResult]:
         """Analyze a single ticker for bagger classification.
 
         Args:
             ticker: Stock ticker symbol to analyze
-            min_days: Minimum number of trading days required for analysis (default: 252 = ~1 year)
+            min_days: Minimum number of trading days required for analysis (default: 1)
 
         Returns:
             BaggerResult if ticker can be analyzed, None if insufficient data or errors
@@ -226,6 +227,38 @@ def batch_analyze_tickers(tickers: list[str], partitioned_data_dir: str = "stock
     return results
 
 
+def save_results_to_csv(results: list[BaggerResult], output_file: str = "bagger_analysis_results.csv"):
+    """Save analysis results to a CSV file.
+
+    Args:
+        results: List of BaggerResult objects
+        output_file: Output CSV file path
+    """
+    if not results:
+        print("No results to save")
+        return
+
+    # Convert results to DataFrame
+    data = {
+        "ticker": [r.ticker for r in results],
+        "bagger_type": [r.bagger_type.value for r in results],
+        "max_return_multiple": [r.max_return_multiple for r in results],
+        "final_return_multiple": [r.final_return_multiple for r in results],
+        "start_price": [r.start_price for r in results],
+        "max_price": [r.max_price for r in results],
+        "final_price": [r.final_price for r in results],
+        "start_date": [r.start_date for r in results],
+        "max_date": [r.max_date for r in results],
+        "final_date": [r.final_date for r in results],
+        "total_days": [r.total_days for r in results],
+        "days_to_peak": [r.days_to_peak for r in results]
+    }
+
+    df = pl.DataFrame(data)
+    df.write_csv(output_file)
+    print(f"Results saved to {output_file}")
+
+
 def save_results_to_parquet(results: list[BaggerResult], output_file: str = "bagger_analysis_results.parquet"):
     """Save analysis results to a parquet file.
 
@@ -258,34 +291,122 @@ def save_results_to_parquet(results: list[BaggerResult], output_file: str = "bag
     print(f"Results saved to {output_file}")
 
 
-if __name__ == "__main__":
-    # Example usage
-    print("=== Single Ticker Analysis Example ===")
-    analyze_single_ticker_example()
+def analyze_all_tickers(partitioned_data_dir: str = "stock_data_partitioned",
+                        progress_interval: int = 1000) -> list[BaggerResult]:
+    """Analyze all available tickers in the partitioned data.
 
-    # # Example of how to get available tickers
-    # analyzer = TickerBaggerAnalyzer()
-    # available_tickers = analyzer.get_available_tickers()
-    # print(f"\nFound {len(available_tickers)} available tickers")
-    #
-    # # Example batch analysis of first 10 tickers
-    # if available_tickers:
-    #     print(f"\n=== Batch Analysis Example (first 10 tickers) ===")
-    #     sample_tickers = available_tickers[:10]
-    #     results = batch_analyze_tickers(sample_tickers)
-    #
-    #     print(f"\nSuccessfully analyzed {len(results)} out of {len(sample_tickers)} tickers")
-    #
-    #     # Show summary by bagger type
-    #     bagger_counts = {}
-    #     for result in results:
-    #         bagger_type = result.bagger_type.value
-    #         bagger_counts[bagger_type] = bagger_counts.get(bagger_type, 0) + 1
-    #
-    #     print("\nBagger Type Summary:")
-    #     for bagger_type, count in sorted(bagger_counts.items()):
-    #         print(f"  {bagger_type}: {count}")
-    #
-    #     # Save results
-    #     if results:
-    #         save_results_to_parquet(results, "sample_bagger_analysis.parquet")
+    Args:
+        partitioned_data_dir: Directory containing partitioned data
+        progress_interval: How often to print progress updates
+
+    Returns:
+        List of BaggerResult objects (only successful analyses)
+    """
+    analyzer = TickerBaggerAnalyzer(partitioned_data_dir)
+
+    # Get all available tickers
+    print("Discovering available tickers...")
+    all_tickers = analyzer.get_available_tickers()
+    print(f"Found {len(all_tickers)} tickers to analyze")
+
+    results = []
+    failed_count = 0
+
+    print("Starting batch analysis of all tickers...")
+    for i, ticker in enumerate(all_tickers, 1):
+        if i % progress_interval == 0:
+            success_rate = ((i - failed_count) / i) * 100
+            print(f"Processed {i:,}/{len(all_tickers):,} tickers... "
+                  f"Success rate: {success_rate:.1f}% "
+                  f"({len(results):,} successful, {failed_count:,} failed)")
+
+        result = analyzer.analyze_ticker(ticker)
+        if result:
+            results.append(result)
+        else:
+            failed_count += 1
+
+    print(f"\n✅ Analysis complete!")
+    print(f"Successfully analyzed: {len(results):,} tickers")
+    print(f"Failed to analyze: {failed_count:,} tickers")
+    print(f"Success rate: {(len(results) / len(all_tickers)) * 100:.1f}%")
+
+    return results
+
+
+def print_summary_stats(results: list[BaggerResult]):
+    """Print summary statistics of the analysis results.
+
+    Args:
+        results: List of BaggerResult objects
+    """
+    if not results:
+        print("No results to summarize")
+        return
+
+    print(f"\n=== BAGGER ANALYSIS SUMMARY ===")
+    print(f"Total analyzed tickers: {len(results):,}")
+
+    # Count by bagger type
+    bagger_counts = {}
+    for result in results:
+        bagger_type = result.bagger_type.value
+        bagger_counts[bagger_type] = bagger_counts.get(bagger_type, 0) + 1
+
+    print(f"\nBagger Type Distribution:")
+    for bagger_type in [BaggerType.HUNDRED_BAGGER.value, BaggerType.MULTIBAGGER.value,
+                        BaggerType.FALLEN_HUNDRED_BAGGER.value, BaggerType.FALLEN_MULTIBAGGER.value,
+                        BaggerType.NO_BAGGER.value]:
+        count = bagger_counts.get(bagger_type, 0)
+        percentage = (count / len(results)) * 100
+        print(f"  {bagger_type}: {count:,} ({percentage:.1f}%)")
+
+    # Top performers
+    hundred_baggers = [r for r in results if r.bagger_type == BaggerType.HUNDRED_BAGGER]
+    multibaggers = [r for r in results if r.bagger_type == BaggerType.MULTIBAGGER]
+    fallen_hundred = [r for r in results if r.bagger_type == BaggerType.FALLEN_HUNDRED_BAGGER]
+
+    if hundred_baggers:
+        top_current = sorted(hundred_baggers, key=lambda x: x.final_return_multiple, reverse=True)[:5]
+        print(f"\nTop 5 Current 100-Baggers (by final return):")
+        for r in top_current:
+            print(f"  {r.ticker}: {r.final_return_multiple:.1f}x (peak: {r.max_return_multiple:.1f}x)")
+
+    if multibaggers:
+        top_multis = sorted(multibaggers, key=lambda x: x.final_return_multiple, reverse=True)[:5]
+        print(f"\nTop 5 Current Multibaggers (by final return):")
+        for r in top_multis:
+            print(f"  {r.ticker}: {r.final_return_multiple:.1f}x (peak: {r.max_return_multiple:.1f}x)")
+
+    if fallen_hundred:
+        top_fallen = sorted(fallen_hundred, key=lambda x: x.max_return_multiple, reverse=True)[:5]
+        print(f"\nTop 5 Fallen 100-Baggers (by peak return):")
+        for r in top_fallen:
+            drawdown = ((r.max_return_multiple - r.final_return_multiple) / r.max_return_multiple) * 100
+            print(f"  {r.ticker}: peaked at {r.max_return_multiple:.1f}x, now {r.final_return_multiple:.1f}x ({drawdown:.1f}% drawdown)")
+
+
+if __name__ == "__main__":
+    print("=== COMPREHENSIVE BAGGER ANALYSIS ===")
+
+    # Analyze all tickers
+    results = analyze_all_tickers()
+
+    if results:
+        # Print summary statistics
+        print_summary_stats(results)
+
+        # Save to both CSV and Parquet
+        print(f"\nSaving results...")
+        save_results_to_csv(results, "bagger_analysis_results.csv")
+        save_results_to_parquet(results, "bagger_analysis_results.parquet")
+
+        print(f"\n✅ Analysis complete! Results saved to:")
+        print(f"  - bagger_analysis_results.csv")
+        print(f"  - bagger_analysis_results.parquet")
+        print(f"\nYou can now analyze the results using:")
+        print(f"  df = pl.read_csv('bagger_analysis_results.csv')")
+        print(f"  # or")
+        print(f"  df = pl.read_parquet('bagger_analysis_results.parquet')")
+    else:
+        print("❌ No successful analyses. Check your data directory and ticker files.")
